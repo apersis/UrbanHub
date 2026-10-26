@@ -1,0 +1,23 @@
+# Dependances du client Python LOCAL (Spark tourne dans Docker via Spark Connect :
+# pas de Java ni winutils en local).
+#
+# /!\ Python requis : 64-bit, version 3.10 / 3.11 / 3.12 (PySpark 3.5 NE supporte PAS
+#     Python 3.13/3.14). Installer dans un venv de la bonne version :
+#       py -3.12 -m venv .venv  &&  .\.venv\Scripts\activate
+#       python -m pip install -r requirements.txt
+#
+# La version de pyspark (client) doit matcher le serveur Docker :
+#   docker compose exec spark bash -lc 'echo $APACHE_SPARK_VERSION'
+
+# Ingestion (NOAA -> MinIO)
+requests>=2.31
+minio>=7.2
+
+# Client Spark Connect + analyses (pandas/pyarrow sont requis par Spark Connect)
+pyspark[connect]>=3.5,<3.6
+pandas>=2.0
+numpy>=2.0        # pyarrow recent exige numpy >= 2.0
+pyarrow>=14
+matplotlib>=3.7
+# Fournit distutils (retire du stdlib en Python 3.12) dont PySpark 3.5 a besoin
+setuptools>=68

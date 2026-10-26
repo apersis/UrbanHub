@@ -1,0 +1,13 @@
+# Secrets
+.env
+
+# Cache local des donnees brutes telechargees (regenerable via l'ingestion)
+data/
+
+# Figures generees par les analyses
+output/
+
+# Artefacts Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

@@ -1,0 +1,149 @@
+services:
+  # ---------------------------------------------------------------------------
+  # Data Lake : stockage objet compatible S3 (architecture Medallion)
+  #   bronze = donnees brutes NOAA (CSV ISD telecharges tels quels)
+  #   silver = donnees nettoyees et typees (Parquet)
+  #   gold   = indicateurs / agregats prets pour l'analyse (Parquet)
+  # Image bitnamilegacy car le proxy d'entreprise bloque minio/* et quay.io.
+  # Tag 2024.12.18 : derniere version MinIO embarquant encore la console web.
+  # ---------------------------------------------------------------------------
+  minio:
+    image: bitnamilegacy/minio:2024.12.18
+    container_name: urbanhub-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      # Creation automatique des buckets Medallion au demarrage
+      MINIO_DEFAULT_BUCKETS: bronze,silver,gold
+    ports:
+      - "9000:9000"   # API S3 (clients python minio, driver s3a de Spark)
+      - "9001:9001"   # Console web (http://localhost:9001)
+    volumes:
+      - minio_data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - urbanhub
+
+  # ---------------------------------------------------------------------------
+  # Serveur Spark Connect : Spark tourne ICI (JVM), le Python LOCAL s'y connecte
+  # via gRPC (sc://localhost:15002). Pas besoin de Java/winutils en local.
+  # Image officielle apache/spark (legere, pas de Jupyter) ; le serveur Connect
+  # est purement JVM (aucun Python requis ici). Les JARs (spark-connect, hadoop-aws)
+  # sont telecharges au 1er demarrage puis caches sur le volume spark_ivy. La
+  # config s3a/MinIO est fixee ici (en mode Connect, le client ne peut pas ajouter
+  # de JARs ni de conf hadoop).
+  # ---------------------------------------------------------------------------
+  spark:
+    image: apache/spark:3.5.0
+    container_name: urbanhub-spark
+    restart: unless-stopped
+    user: root   # ecrit le cache Ivy (JARs) et les logs
+    entrypoint: ["/bin/bash", "-lc"]
+    environment:
+      HOME: /opt/spark   # le cache Ivy tombe sur le volume spark_ivy
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    # $$VAR = variable lue dans le conteneur (pas interpolee par compose).
+    command:
+      - >
+        "$${SPARK_HOME}/sbin/start-connect-server.sh"
+        --packages org.apache.spark:spark-connect_2.12:3.5.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262
+        --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
+        --conf spark.hadoop.fs.s3a.access.key=$${MINIO_ACCESS_KEY}
+        --conf spark.hadoop.fs.s3a.secret.key=$${MINIO_SECRET_KEY}
+        --conf spark.hadoop.fs.s3a.path.style.access=true
+        --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+        --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false
+        --conf spark.sql.session.timeZone=UTC
+        --conf spark.driver.memory=3g
+        --conf spark.sql.shuffle.partitions=32
+        && tail -f /dev/null
+    ports:
+      - "15002:15002"   # Spark Connect (gRPC) : le client local s'y branche
+      - "4040:4040"     # Spark UI (http://localhost:4040 pendant un job)
+    volumes:
+      - spark_ivy:/opt/spark/.ivy2    # Cache des JARs (spark-connect, hadoop-aws)
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'echo > /dev/tcp/localhost/15002' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 120s   # 1er demarrage : telechargement des JARs
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - urbanhub
+
+  # ---------------------------------------------------------------------------
+  # Collecteurs en ARRIÈRE-PLAN (flux continu). Démarrés à la demande via profils :
+  #   docker compose --profile velos up -d        (vélos CityBikes)
+  #   docker compose --profile pollution up -d     (pollution OpenAQ, clé requise)
+  # Suivre :  docker compose logs -f collector-citybikes   |  Arrêter : docker compose stop ...
+  # Image python:3.12-slim (legere) ; on installe requests+minio au demarrage.
+  # Le collecteur velos cible par defaut les grandes villes (Paris, Nantes, Bordeaux,
+  # Strasbourg, Marseille, Rennes, Dijon, Clermont, Metz) ; retirer --networks pour
+  # collecter les 66 reseaux FR (plus lent, 429).
+  # ---------------------------------------------------------------------------
+  collector-citybikes:
+    image: python:3.12-slim
+    container_name: urbanhub-collector-velos
+    profiles: ["velos"]
+    restart: unless-stopped
+    working_dir: /app
+    entrypoint: ["/bin/bash", "-lc"]
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      PYTHONUNBUFFERED: "1"
+    command:
+      - >
+        pip install -q requests minio &&
+        python -m p2_mobilite.collecte --interval 150 --workers 4
+        --networks velib bicloo v3-bordeaux velhop le-velo le-velo-star divia-velodi c-velo graoulib
+    volumes:
+      - ./:/app
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - urbanhub
+
+  collector-openaq:
+    image: python:3.12-slim
+    container_name: urbanhub-collector-pollution
+    profiles: ["pollution"]
+    restart: unless-stopped
+    working_dir: /app
+    entrypoint: ["/bin/bash", "-lc"]
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      OPENAQ_API_KEY: ${OPENAQ_API_KEY:-}   # à définir dans .env
+      PYTHONUNBUFFERED: "1"
+    command:
+      - >
+        pip install -q requests minio &&
+        python -m p3_pollution.collecte --interval 300 --workers 4 --max-locations 150
+    volumes:
+      - ./:/app
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - urbanhub
+
+volumes:
+  minio_data:
+  spark_ivy:
+
+networks:
+  urbanhub:
+    driver: bridge
