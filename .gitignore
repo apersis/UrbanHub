@@ -1,6 +1,9 @@
 # Secrets
 .env
 
+# Environnement virtuel Python (spécifique à la machine, à recréer via requirements.txt)
+.venv/
+
 # Cache local des donnees brutes telechargees (regenerable via l'ingestion)
 data/
 
